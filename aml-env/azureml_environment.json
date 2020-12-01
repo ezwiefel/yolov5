@@ -1,0 +1,21 @@
+{
+    "name": "PyTorch-1.7-GPU",
+    "environmentVariables": {
+        "NCCL_TREE_THRESHOLD": "0"
+    },
+    "python": {
+        "userManagedDependencies": false,
+        "interpreterPath": "python"
+    },
+    "docker": {
+        "enabled": false,
+        "baseImage": "mcr.microsoft.com/azureml/openmpi3.1.2-cuda10.2-cudnn7-ubuntu18.04:latest",
+        "sharedVolumes": true,
+        "shmSize": null,
+        "platform": {
+            "os": "Linux",
+            "architecture": "amd64"
+        }
+    },
+    "inferencingStackVersion": null
+}
