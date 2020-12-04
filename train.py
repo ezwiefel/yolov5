@@ -3,9 +3,11 @@ import logging
 import math
 import os
 import random
+from threading import local
 import time
 from pathlib import Path
 from warnings import warn
+from matplotlib.pyplot import xcorr
 
 import numpy as np
 import torch.distributed as dist
@@ -35,13 +37,14 @@ from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_di
 logger = logging.getLogger(__name__)
 
 try:
-    import wandb
+    import mlflow
+    import mlflow.pytorch
+    # mlflow.start_run()
 except ImportError:
-    wandb = None
-    logger.info("Install Weights & Biases for experiment logging via 'pip install wandb' (recommended)")
+    mlflow = None
+    logger.info("Install MLFLow for experiment logging")
 
-
-def train(hyp, opt, device, tb_writer=None, wandb=None):
+def train(hyp, opt, device, tb_writer=None, mlflow=None):
     logger.info(f'Hyperparameters {hyp}')
     save_dir, epochs, batch_size, total_batch_size, weights, rank = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank
@@ -127,13 +130,17 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # plot_lr_scheduler(optimizer, scheduler, epochs)
 
+
+    ### MLFLOW UPDATES
     # Logging
-    if wandb and wandb.run is None:
+    # if wandb and wandb.run is None:
+    if mlflow:
         opt.hyp = hyp  # add hyperparameters
-        wandb_run = wandb.init(config=opt, resume="allow",
-                               project='YOLOv5' if opt.project == 'runs/train' else Path(opt.project).stem,
-                               name=save_dir.stem,
-                               id=ckpt.get('wandb_id') if 'ckpt' in locals() else None)
+        mlflow.log_params(opt.__dict__)
+        # wandb_run = wandb.init(config=opt, resume="allow",
+        #                        project='YOLOv5' if opt.project == 'runs/train' else Path(opt.project).stem,
+        #                        name=save_dir.stem,
+        #                        id=ckpt.get('wandb_id') if 'ckpt' in locals() else None)
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
@@ -203,8 +210,15 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 plot_labels(labels, save_dir=save_dir)
                 if tb_writer:
                     tb_writer.add_histogram('classes', c, 0)
-                if wandb:
-                    wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('*labels*.png')]})
+
+                ####################################
+                ##### DONE: UPDATE LOGGING HERE ####
+                ####################################
+                if mlflow:
+                    for file in save_dir.glob('*labels*.png'):
+                        mlflow.log_artifact(local_path=str(file), artifact_path=f"labels/{file.name}")
+                # if wandb:
+                #     wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('*labels*.png')]})
 
             # Anchors
             if not opt.noautoanchor:
@@ -314,8 +328,13 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     # if tb_writer:
                     #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     #     tb_writer.add_graph(model, imgs)  # add model to tensorboard
-                elif plots and ni == 3 and wandb:
-                    wandb.log({"Mosaics": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('train*.jpg')]})
+                    
+                ####################################
+                ##### DONE: UPDATE LOGGING HERE ####
+                ####################################
+                elif plots and ni == 3 and mlflow:
+                    for file in save_dir.glob('train*.jpg'):
+                        mlflow.log_artifact(local_path=str(file), artifact_path=f"mosiacs/{file.name}")
 
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------
@@ -339,7 +358,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                                                  dataloader=testloader,
                                                  save_dir=save_dir,
                                                  plots=plots and final_epoch,
-                                                 log_imgs=opt.log_imgs if wandb else 0)
+                                                 log_imgs=opt.log_imgs if mlflow else 0)  # TODO: WandB Reference
 
             # Write
             with open(results_file, 'a') as f:
@@ -355,8 +374,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             for x, tag in zip(list(mloss[:-1]) + list(results) + lr, tags):
                 if tb_writer:
                     tb_writer.add_scalar(tag, x, epoch)  # tensorboard
-                if wandb:
-                    wandb.log({tag: x})  # W&B
+                if mlflow:
+                    mlflow.set_tag(tag.replace(":", "_"), xcorr)
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -371,13 +390,14 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                             'best_fitness': best_fitness,
                             'training_results': f.read(),
                             'model': ema.ema,
-                            'optimizer': None if final_epoch else optimizer.state_dict(),
-                            'wandb_id': wandb_run.id if wandb else None}
+                            'optimizer': None if final_epoch else optimizer.state_dict()} # TODO: WandB Reference
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
+                mlflow.pytorch.log_model(ckpt, artifact_path="last_model")
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+                    mlflow.pytorch.log_model(ckpt, artifact_path="best_model")
                 del ckpt
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
@@ -395,14 +415,17 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         # Finish
         if plots:
             plot_results(save_dir=save_dir)  # save as results.png
-            if wandb:
-                wandb.log({"Results": [wandb.Image(str(save_dir / x), caption=x) for x in
-                                       ['results.png', 'precision_recall_curve.png']]})
+            ####################################
+            ##### DONE: UPDATE LOGGING HERE ####
+            ####################################
+            if mlflow:
+                for plot in ['results.png', 'precision_recall_curve.png']:
+                    mlflow.log_artifact(local_path=os.path.join(save_dir, plot))
+
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
     else:
         dist.destroy_process_group()
-
-    wandb.run.finish() if wandb and wandb.run else None
+    
     torch.cuda.empty_cache()
     return results
 
@@ -438,135 +461,136 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     opt = parser.parse_args()
 
-    # Set DDP variables
-    opt.total_batch_size = opt.batch_size
-    opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
-    opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
-    set_logging(opt.global_rank)
-    if opt.global_rank in [-1, 0]:
-        check_git_status()
-
-    # Resume
-    if opt.resume:  # resume an interrupted run
-        ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
-        assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
-        with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
-            opt = argparse.Namespace(**yaml.load(f, Loader=yaml.FullLoader))  # replace
-        opt.cfg, opt.weights, opt.resume = '', ckpt, True
-        logger.info('Resuming training from %s' % ckpt)
-    else:
-        # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
-        opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
-        assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
-        opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
-        opt.name = 'evolve' if opt.evolve else opt.name
-        opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
-
-    # DDP mode
-    device = select_device(opt.device, batch_size=opt.batch_size)
-    if opt.local_rank != -1:
-        assert torch.cuda.device_count() > opt.local_rank
-        torch.cuda.set_device(opt.local_rank)
-        device = torch.device('cuda', opt.local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
-        assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
-        opt.batch_size = opt.total_batch_size // opt.world_size
-
-    # Hyperparameters
-    with open(opt.hyp) as f:
-        hyp = yaml.load(f, Loader=yaml.FullLoader)  # load hyps
-        if 'box' not in hyp:
-            warn('Compatibility: %s missing "box" which was renamed from "giou" in %s' %
-                 (opt.hyp, 'https://github.com/ultralytics/yolov5/pull/1120'))
-            hyp['box'] = hyp.pop('giou')
-
-    # Train
-    logger.info(opt)
-    if not opt.evolve:
-        tb_writer = None  # init loggers
+    with mlflow.start_run() as run:
+        # Set DDP variables
+        opt.total_batch_size = opt.batch_size
+        opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
+        opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
+        set_logging(opt.global_rank)
         if opt.global_rank in [-1, 0]:
-            logger.info(f'Start Tensorboard with "tensorboard --logdir {opt.project}", view at http://localhost:6006/')
-            tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
-        train(hyp, opt, device, tb_writer, wandb)
+            check_git_status()
 
-    # Evolve hyperparameters (optional)
-    else:
-        # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
-        meta = {'lr0': (1, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
-                'lrf': (1, 0.01, 1.0),  # final OneCycleLR learning rate (lr0 * lrf)
-                'momentum': (0.3, 0.6, 0.98),  # SGD momentum/Adam beta1
-                'weight_decay': (1, 0.0, 0.001),  # optimizer weight decay
-                'warmup_epochs': (1, 0.0, 5.0),  # warmup epochs (fractions ok)
-                'warmup_momentum': (1, 0.0, 0.95),  # warmup initial momentum
-                'warmup_bias_lr': (1, 0.0, 0.2),  # warmup initial bias lr
-                'box': (1, 0.02, 0.2),  # box loss gain
-                'cls': (1, 0.2, 4.0),  # cls loss gain
-                'cls_pw': (1, 0.5, 2.0),  # cls BCELoss positive_weight
-                'obj': (1, 0.2, 4.0),  # obj loss gain (scale with pixels)
-                'obj_pw': (1, 0.5, 2.0),  # obj BCELoss positive_weight
-                'iou_t': (0, 0.1, 0.7),  # IoU training threshold
-                'anchor_t': (1, 2.0, 8.0),  # anchor-multiple threshold
-                'anchors': (2, 2.0, 10.0),  # anchors per output grid (0 to ignore)
-                'fl_gamma': (0, 0.0, 2.0),  # focal loss gamma (efficientDet default gamma=1.5)
-                'hsv_h': (1, 0.0, 0.1),  # image HSV-Hue augmentation (fraction)
-                'hsv_s': (1, 0.0, 0.9),  # image HSV-Saturation augmentation (fraction)
-                'hsv_v': (1, 0.0, 0.9),  # image HSV-Value augmentation (fraction)
-                'degrees': (1, 0.0, 45.0),  # image rotation (+/- deg)
-                'translate': (1, 0.0, 0.9),  # image translation (+/- fraction)
-                'scale': (1, 0.0, 0.9),  # image scale (+/- gain)
-                'shear': (1, 0.0, 10.0),  # image shear (+/- deg)
-                'perspective': (0, 0.0, 0.001),  # image perspective (+/- fraction), range 0-0.001
-                'flipud': (1, 0.0, 1.0),  # image flip up-down (probability)
-                'fliplr': (0, 0.0, 1.0),  # image flip left-right (probability)
-                'mosaic': (1, 0.0, 1.0),  # image mixup (probability)
-                'mixup': (1, 0.0, 1.0)}  # image mixup (probability)
+        # Resume
+        if opt.resume:  # resume an interrupted run
+            ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
+            assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
+            with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
+                opt = argparse.Namespace(**yaml.load(f, Loader=yaml.FullLoader))  # replace
+            opt.cfg, opt.weights, opt.resume = '', ckpt, True
+            logger.info('Resuming training from %s' % ckpt)
+        else:
+            # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
+            opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
+            assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
+            opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
+            opt.name = 'evolve' if opt.evolve else opt.name
+            opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
 
-        assert opt.local_rank == -1, 'DDP mode not implemented for --evolve'
-        opt.notest, opt.nosave = True, True  # only test/save final epoch
-        # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
-        yaml_file = Path(opt.save_dir) / 'hyp_evolved.yaml'  # save best result here
-        if opt.bucket:
-            os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
+        # DDP mode
+        device = select_device(opt.device, batch_size=opt.batch_size)
+        if opt.local_rank != -1:
+            assert torch.cuda.device_count() > opt.local_rank
+            torch.cuda.set_device(opt.local_rank)
+            device = torch.device('cuda', opt.local_rank)
+            dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
+            assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
+            opt.batch_size = opt.total_batch_size // opt.world_size
 
-        for _ in range(300):  # generations to evolve
-            if Path('evolve.txt').exists():  # if evolve.txt exists: select best hyps and mutate
-                # Select parent(s)
-                parent = 'single'  # parent selection method: 'single' or 'weighted'
-                x = np.loadtxt('evolve.txt', ndmin=2)
-                n = min(5, len(x))  # number of previous results to consider
-                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
-                w = fitness(x) - fitness(x).min()  # weights
-                if parent == 'single' or len(x) == 1:
-                    # x = x[random.randint(0, n - 1)]  # random selection
-                    x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
-                elif parent == 'weighted':
-                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
+        # Hyperparameters
+        with open(opt.hyp) as f:
+            hyp = yaml.load(f, Loader=yaml.FullLoader)  # load hyps
+            if 'box' not in hyp:
+                warn('Compatibility: %s missing "box" which was renamed from "giou" in %s' %
+                    (opt.hyp, 'https://github.com/ultralytics/yolov5/pull/1120'))
+                hyp['box'] = hyp.pop('giou')
 
-                # Mutate
-                mp, s = 0.8, 0.2  # mutation probability, sigma
-                npr = np.random
-                npr.seed(int(time.time()))
-                g = np.array([x[0] for x in meta.values()])  # gains 0-1
-                ng = len(meta)
-                v = np.ones(ng)
-                while all(v == 1):  # mutate until a change occurs (prevent duplicates)
-                    v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
-                for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
-                    hyp[k] = float(x[i + 7] * v[i])  # mutate
+        # Train
+        logger.info(opt)
+        if not opt.evolve:
+            tb_writer = None  # init loggers
+            if opt.global_rank in [-1, 0]:
+                logger.info(f'Start Tensorboard with "tensorboard --logdir {opt.project}", view at http://localhost:6006/')
+                tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
+            train(hyp, opt, device, tb_writer, mlflow)
 
-            # Constrain to limits
-            for k, v in meta.items():
-                hyp[k] = max(hyp[k], v[1])  # lower limit
-                hyp[k] = min(hyp[k], v[2])  # upper limit
-                hyp[k] = round(hyp[k], 5)  # significant digits
+        # Evolve hyperparameters (optional)
+        else:
+            # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
+            meta = {'lr0': (1, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
+                    'lrf': (1, 0.01, 1.0),  # final OneCycleLR learning rate (lr0 * lrf)
+                    'momentum': (0.3, 0.6, 0.98),  # SGD momentum/Adam beta1
+                    'weight_decay': (1, 0.0, 0.001),  # optimizer weight decay
+                    'warmup_epochs': (1, 0.0, 5.0),  # warmup epochs (fractions ok)
+                    'warmup_momentum': (1, 0.0, 0.95),  # warmup initial momentum
+                    'warmup_bias_lr': (1, 0.0, 0.2),  # warmup initial bias lr
+                    'box': (1, 0.02, 0.2),  # box loss gain
+                    'cls': (1, 0.2, 4.0),  # cls loss gain
+                    'cls_pw': (1, 0.5, 2.0),  # cls BCELoss positive_weight
+                    'obj': (1, 0.2, 4.0),  # obj loss gain (scale with pixels)
+                    'obj_pw': (1, 0.5, 2.0),  # obj BCELoss positive_weight
+                    'iou_t': (0, 0.1, 0.7),  # IoU training threshold
+                    'anchor_t': (1, 2.0, 8.0),  # anchor-multiple threshold
+                    'anchors': (2, 2.0, 10.0),  # anchors per output grid (0 to ignore)
+                    'fl_gamma': (0, 0.0, 2.0),  # focal loss gamma (efficientDet default gamma=1.5)
+                    'hsv_h': (1, 0.0, 0.1),  # image HSV-Hue augmentation (fraction)
+                    'hsv_s': (1, 0.0, 0.9),  # image HSV-Saturation augmentation (fraction)
+                    'hsv_v': (1, 0.0, 0.9),  # image HSV-Value augmentation (fraction)
+                    'degrees': (1, 0.0, 45.0),  # image rotation (+/- deg)
+                    'translate': (1, 0.0, 0.9),  # image translation (+/- fraction)
+                    'scale': (1, 0.0, 0.9),  # image scale (+/- gain)
+                    'shear': (1, 0.0, 10.0),  # image shear (+/- deg)
+                    'perspective': (0, 0.0, 0.001),  # image perspective (+/- fraction), range 0-0.001
+                    'flipud': (1, 0.0, 1.0),  # image flip up-down (probability)
+                    'fliplr': (0, 0.0, 1.0),  # image flip left-right (probability)
+                    'mosaic': (1, 0.0, 1.0),  # image mixup (probability)
+                    'mixup': (1, 0.0, 1.0)}  # image mixup (probability)
 
-            # Train mutation
-            results = train(hyp.copy(), opt, device, wandb=wandb)
+            assert opt.local_rank == -1, 'DDP mode not implemented for --evolve'
+            opt.notest, opt.nosave = True, True  # only test/save final epoch
+            # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
+            yaml_file = Path(opt.save_dir) / 'hyp_evolved.yaml'  # save best result here
+            if opt.bucket:
+                os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
 
-            # Write mutation results
-            print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
+            for _ in range(300):  # generations to evolve
+                if Path('evolve.txt').exists():  # if evolve.txt exists: select best hyps and mutate
+                    # Select parent(s)
+                    parent = 'single'  # parent selection method: 'single' or 'weighted'
+                    x = np.loadtxt('evolve.txt', ndmin=2)
+                    n = min(5, len(x))  # number of previous results to consider
+                    x = x[np.argsort(-fitness(x))][:n]  # top n mutations
+                    w = fitness(x) - fitness(x).min()  # weights
+                    if parent == 'single' or len(x) == 1:
+                        # x = x[random.randint(0, n - 1)]  # random selection
+                        x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
+                    elif parent == 'weighted':
+                        x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
 
-        # Plot results
-        plot_evolution(yaml_file)
-        print(f'Hyperparameter evolution complete. Best results saved as: {yaml_file}\n'
-              f'Command to train a new model with these hyperparameters: $ python train.py --hyp {yaml_file}')
+                    # Mutate
+                    mp, s = 0.8, 0.2  # mutation probability, sigma
+                    npr = np.random
+                    npr.seed(int(time.time()))
+                    g = np.array([x[0] for x in meta.values()])  # gains 0-1
+                    ng = len(meta)
+                    v = np.ones(ng)
+                    while all(v == 1):  # mutate until a change occurs (prevent duplicates)
+                        v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
+                    for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
+                        hyp[k] = float(x[i + 7] * v[i])  # mutate
+
+                # Constrain to limits
+                for k, v in meta.items():
+                    hyp[k] = max(hyp[k], v[1])  # lower limit
+                    hyp[k] = min(hyp[k], v[2])  # upper limit
+                    hyp[k] = round(hyp[k], 5)  # significant digits
+
+                # Train mutation
+                results = train(hyp.copy(), opt, device, mlflow=mlflow)
+
+                # Write mutation results
+                print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
+
+            # Plot results
+            plot_evolution(yaml_file)
+            print(f'Hyperparameter evolution complete. Best results saved as: {yaml_file}\n'
+                f'Command to train a new model with these hyperparameters: $ python train.py --hyp {yaml_file}')

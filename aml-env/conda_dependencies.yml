@@ -6,12 +6,16 @@ dependencies:
 - numpy=1.19.4
 - pip
 - cmake=3.18.2
+- opencv>=4.1.2
+- mesa-libgl-devel-cos6-x86_64=11.0.7
+- Cython=0.29.21
 - pip:
   - azureml-core==1.18.0.post1
   - azureml-defaults==1.18.0
   - azureml-telemetry==1.18.0
   - azureml-train-restclients-hyperdrive==1.18.0
   - azureml-train-core==1.18.0
+  - azureml-mlflow==1.18.0.post1
   - torch==1.7.0
   - torchvision==0.8.1
   - horovod==0.21.0
@@ -20,3 +24,6 @@ dependencies:
   - tqdm==4.41.0
   - PyYAML==5.3
   - Pillow
+  - matplotlib>=3.2.2
+  - scipy>=1.4.1
+  # - opencv-python>=4.1.2

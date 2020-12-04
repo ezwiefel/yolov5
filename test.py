@@ -75,11 +75,13 @@ def test(data,
     niou = iouv.numel()
 
     # Logging
-    log_imgs, wandb = min(log_imgs, 100), None  # ceil
+    log_imgs = min(log_imgs, 100), None
+
     try:
-        import wandb  # Weights & Biases
+        import mlflow
     except ImportError:
         log_imgs = 0
+        mlflow = None
 
     # Dataloader
     if not training:
